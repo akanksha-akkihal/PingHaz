@@ -7,44 +7,77 @@ We are going to implement the Publish-on-Ping (POP)[1] technique inside Meta's F
 
 ## Background
 
-Lock-free data structures let many threads read and update shared data without locks, which is why they scale on multi-core machines. In languages without garbage collection (C, C++, Rust), they need a safe memory reclamation (SMR) scheme. When a writer removes a node, it cannot free it immediately, because another thread may still be reading it.
+Lock-free data structures let many threads share data without locks, but in languages without garbage collection they need a safe way to free memory. A removed node can't be freed right away, because another thread might still be reading it.
 
-**Hazard pointers (HP)** fix this by having readers announce each node before using it:
-```
-protect(src):
-    do:
-        p = src.load()
-        my_hazard_slot = p          // announce
-        MFENCE                      // make it visible before re-checking
-    while p != src.load()           // still reachable?
-    return p
-```
+**Hazard pointers (HP)** solve this by having readers announce each node before using it, so writers only free nodes no one has announced. This is safe even if a thread gets stuck, but readers pay for a memory fence on every node they visit. **Epoch-based reclamation (EBR)** is faster for readers, but one stuck thread can stop all memory from being freed.
 
-When a writer removes a node, it doesn't free it right away. It puts the node on a retired list and later frees only the nodes that no thread has in its hazard slot. This makes HP robust, since a stuck thread can only hold onto a few nodes. The downside is that readers need a fence for every node they visit, which gets expensive when most operations are reads. **Epoch-based reclamation (EBR)** is much cheaper for readers, but if even one thread gets stuck, no memory can be freed, so memory use can keep growing.
+Two newer designs keep HP's safety without the per-read fence:
 
-Two newer designs keep hazard pointers' safety but remove the fence from the read path:
+- **Folly's hazard pointers** (Meta) move the fence to the reclaimer, which calls Linux `membarrier()` before scanning.
+- **Publish-on-Ping (POP)** [1] keeps readers' reservations private, and the reclaimer uses signals to ask threads to publish them.
 
-- **Folly's hazard pointers** (from Meta, used in production code like `ConcurrentHashMap`) use asymmetric fences. Readers only use a cheap compiler barrier. Before scanning hazard slots, the reclaimer calls Linux `membarrier()`, which forces every thread in the process to execute a memory barrier.
-- **Publish-on-Ping (POP)** [1] has readers keep their reservations private, with no fences at all. When a reclaimer wants to scan, it sends a POSIX signal to every thread, and each thread's signal handler publishes its reservations.
-
-Both designs make reads cheap and push the cost onto reclamation, which happens rarely. They just use different OS mechanisms to do it, and comparing them is the focus of our project. We will implement POP in Meta's open-source Folly library, and then compare it against Folly's existing `membarrier` approach and the classic schemes.
-
+We will implement POP in Folly and compare the two approaches.
 
 ## The Challenge
 
-The cost of memory reclamation comes from several things at once: memory ordering, cache coherence, and how the OS schedules threads. Because these interact, we can't predict which scheme will win without building and measuring them. We want to learn how these costs trade off as the number of threads and the workload change.
+Reclamation cost depends on memory ordering, cache coherence, and OS scheduling all at once, so we can't predict which scheme wins without building and measuring them.
 
-### Workload Characteristics
+- **Workload:** threads run random lookups, inserts, and deletes on a shared lock-free list or hash table. We vary the read/write mix, key range, and thread count.
+- **Correctness:** with no locks, a reader's announcement and a reclaimer's scan must happen in the right order, which is easy to get wrong.
+- **Memory and communication:** pointer chasing has poor locality, and shared hazard slots and retired lists cause cache coherence traffic.
+- **System constraints:** x86 can reorder a store with a later load, which every scheme must handle. POP's signals add their own challenges: handlers must be async-signal-safe, threads that aren't running delay reclamation, and Folly is a large codebase to work in.
 
-- **Workload:** Each thread runs a loop of random lookups, inserts, and deletes on a shared lock-free list or hash table. We vary the read/write mix, the key range, and the number of threads. A smaller key range means more threads hit the same nodes, so there is more contention.
-- **Dependencies:** Readers and writers run at the same time without locks. The code is only correct if a reader's announcement and a reclaimer's scan happen in the right order, which is easy to get wrong.
-- **Memory access and communication:** Traversing a list means following pointers to scattered memory, so there is little locality. Hazard slots, epoch counters, and retired lists are shared between threads, so every publish and scan causes cache coherence traffic. Each thread's slots also need padding to avoid false sharing.
+## Resources
 
-### System Constraints
+## Resources
 
-- On x86, a store followed by a load can be reordered by the CPU. This is exactly what hazard pointers need to prevent, so every scheme must handle it correctly.
-- With POP, a reclaimer has to wait for every thread to run its signal handler, so a thread that isn't currently running can delay reclamation.
-- Signal handlers can only use a limited set of safe operations, and a signal can arrive in the middle of a traversal. We also need to keep track of which threads are alive, even if a thread exits while a reclaimer is signaling it.
-- Folly is a large production codebase that is hard to build, and our POP code has to work within it.
+- [Folly](https://github.com/facebook/folly)
+- [Publish on Ping (Singh and Brown, PPoPP 2025)](https://arxiv.org/abs/2501.04250)
 
+
+## Goals and Deliverables
+
+We plan to reimplement POP, integrate it into Folly, and compare it against production and textbook baselines.
+
+### Plan to achieve
+
+- **Reimplement POP:** build a test harness with a lock-free list and hash table, and implement POP alongside EBR, textbook hazard pointers, and a never-free baseline.
+- **Integrate into Folly:** first swap `membarrier` for signals to measure their cost, then implement full POP, keeping Folly's existing API.
+- **Evaluation:** measure throughput as threads increase, memory use when a thread stalls, tail latency, and oversubscription, using perf counters to explain the results.
+
+### Hope to achieve
+
+- EpochPOP and Hazard Eras
+- Folly's `ConcurrentHashMap` as a real-world workload
+- A pull request to Folly with our changes and benchmarks
+
+## Questions We Will Answer
+
+- Are signals or `membarrier` cheaper, and does that change with more threads or more frequent reclamation?
+- How do these schemes affect tail latency, not just throughput?
+- How do POP and Folly behave when threads aren't always running?
+- How much of POP's benefit comes from removing the fence vs. keeping reservations private?
+- Does shifting cost from readers to reclaimers make the system faster overall, or just move the slowdown elsewhere?
+
+## Platform Choice
+
+We'll develop on our local Linux machines and benchmark on PSC, whose many cores let us see how costs change as we add threads. We'll use [Google Benchmark](https://github.com/google/benchmark) to measure runtime and memory usage.
+
+## Schedule
+
+**Week 1 (11/9 – 11/15)**
+- Build a lock-free list and our reclamation implementations.
+- Set up the Folly build and benchmarks, and trace the `hazptr_holder` and `membarrier()` code.
+
+**Week 2 (11/16 – 11/22)**
+- Integrate POP into Folly's hazard pointers.
+- Stress test on Folly's `ConcurrentHashMap` to check for use-after-free and ABA bugs.
+
+**Week 3 (11/23 – 11/29)**
+- Profile with perf: oversubscription tests, context switches, signal latency, and CPU stalls.
+- Make throughput and tail-latency graphs, draft the final report, and prepare the upstream PR.
+
+## References
+
+[1] Ajay Singh and Trevor Brown. 2025. Publish on Ping: A Better Way to Publish Reservations in Memory Reclamation for Concurrent Data Structures. In *PPoPP '25*, Las Vegas, NV, USA. ACM. https://doi.org/10.1145/3710848.3710890
 
