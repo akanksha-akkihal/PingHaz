@@ -77,6 +77,9 @@ We'll develop on our local Linux machines and benchmark on PSC, whose many cores
 - Profile with perf: oversubscription tests, context switches, signal latency, and CPU stalls.
 - Make throughput and tail-latency graphs, draft the final report, and prepare the upstream PR.
 
+**Week 4 (11/30 - 12/6)**
+- Finalize the final report, the website, poster, and other visualization demo for the presentation.
+
 ## References
 
 [1] Ajay Singh and Trevor Brown. 2025. Publish on Ping: A Better Way to Publish Reservations in Memory Reclamation for Concurrent Data Structures. In *PPoPP '25*, Las Vegas, NV, USA. ACM. https://doi.org/10.1145/3710848.3710890
